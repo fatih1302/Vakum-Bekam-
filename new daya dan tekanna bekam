@@ -1,0 +1,323 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include "DFRobot_MPX5700.h"
+
+// ==========================================
+// 1. DEKLARASI HARDWARE & PIN
+// ==========================================
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+#define I2C_ADDRESS 0x16
+DFRobot_MPX5700 mpx5700(&Wire, I2C_ADDRESS);
+
+// Pin Tombol (Aktif LOW dengan Internal Pull-Up)
+#define BTN_MODE 19  // Tombol 1: Mode & Pindah Kursor (Klik & Tahan)
+#define BTN_UP 18    // Tombol 2: Nilai Naik
+#define BTN_DOWN 5   // Tombol 3: Nilai Turun
+#define BTN_TRIG 17  // Tombol 4: Pelatuk (Trigger Motor)
+
+// Pin Output PWM ke MOSFET D4184
+#define MOTOR_VACUUM 25
+#define MOTOR_SPRAY 26
+
+// ==========================================
+// 2. VARIABEL SISTEM & STATE MENU
+// ==========================================
+bool modeBekam = true;       // True = Bekam, False = Spray
+bool editTargetMode = true;  // True = Set Target Tekanan, False = Set Speed (Khusus Bekam)
+
+float targetTekanan = -300.0; 
+int speedBekam = 10; 
+int speedSpray = 10;
+
+// Variabel untuk Logika Tombol
+unsigned long waktuTekanMode = 0;
+bool modeSedangDitekan = false;
+bool longPressTereksekusi = false;
+bool btnUpWasPressed = false;
+bool btnDownWasPressed = false;
+
+// ==========================================
+// 3. VARIABEL KEAMANAN & SENSOR
+// ==========================================
+#define BATAS_MAKSIMAL_MMHG -650.0 // Batas maksimal -650 mmHg
+float toleransiKebocoran = 20.0; // Jeda toleransi agar motor tidak bergetar (nyala-mati cepat)
+
+float tekananAwal_mmHg = 0.0;
+float tekananGaugeSaatIni = 0.0;
+bool motorVakumAktif = false; // Mengingat status hisap saat proses stabilisasi
+
+// Properti PWM ESP32 (Core API v3.x)
+const int freq = 5000;
+const int res = 8;
+
+// ==========================================
+// SETUP AWAL
+// ==========================================
+void setup() {
+  Serial.begin(115200);
+
+  // Inisialisasi Pin Tombol
+  pinMode(BTN_MODE, INPUT_PULLUP);
+  pinMode(BTN_UP, INPUT_PULLUP);
+  pinMode(BTN_DOWN, INPUT_PULLUP);
+  pinMode(BTN_TRIG, INPUT_PULLUP);
+
+  // Inisialisasi PWM Motor
+  ledcAttach(MOTOR_VACUUM, freq, res);
+  ledcAttach(MOTOR_SPRAY, freq, res);
+  ledcWrite(MOTOR_VACUUM, 0);
+  ledcWrite(MOTOR_SPRAY, 0);
+
+  // Inisialisasi Layar OLED
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED Gagal!");
+    for(;;);
+  }
+  display.setRotation(3); // Orientasi Vertikal
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(2, 40);
+  display.print("ALAT BEKAM");
+  display.setCursor(2, 55);
+  display.print("M.FATIH.A");
+  display.display();
+
+  // Inisialisasi Sensor MPX5700AP
+  if (mpx5700.begin() == false) {
+    display.clearDisplay();
+    display.setCursor(2, 50);
+    display.print("Sensor Error!");
+    display.display();
+    while(1);
+  }
+
+  // Kalibrasi Auto-Tare (Mencari titik 0 mmHg saat alat dihidupkan)
+  float total_kPa = 0;
+  for(int i = 0; i < 10; i++) {
+    total_kPa += mpx5700.getPressureValue_kpa(0);
+    delay(100);
+  }
+  tekananAwal_mmHg = (total_kPa / 10.0) * 7.50062;
+}
+
+// ==========================================
+// LOOP UTAMA
+// ==========================================
+void loop() {
+  bacaTombolMode();
+  bacaTombolSetting();
+  bacaSensorMpx();
+  eksekusiPelatuk();
+  tampilkanLayarAktif();
+}
+
+// ==========================================
+// FUNGSI-FUNGSI LOGIKA
+// ==========================================
+
+void bacaTombolMode() {
+  if (digitalRead(BTN_MODE) == LOW) {
+    if (!modeSedangDitekan) {
+      // Baru mulai ditekan
+      modeSedangDitekan = true;
+      waktuTekanMode = millis();
+      longPressTereksekusi = false;
+    } else {
+      // Jika ditahan lebih dari 600ms (Long Press)
+      if ((millis() - waktuTekanMode > 600) && !longPressTereksekusi) {
+        longPressTereksekusi = true;
+        if (modeBekam) {
+          editTargetMode = !editTargetMode; // Pindah kursor Target <-> Speed
+        }
+      }
+    }
+  } else {
+    // Tombol dilepas
+    if (modeSedangDitekan) {
+      modeSedangDitekan = false;
+      // Jika dilepas sebelum 600ms (Short Press)
+      if (!longPressTereksekusi) {
+        modeBekam = !modeBekam; // Ganti mode Bekam <-> Spray
+      }
+    }
+  }
+}
+
+void bacaTombolSetting() {
+  // Logika Tombol Naik (UP)
+  bool btnUpState = digitalRead(BTN_UP) == LOW;
+  if (btnUpState && !btnUpWasPressed) {
+    btnUpWasPressed = true;
+    if (modeBekam) {
+      if (editTargetMode) {
+        targetTekanan += 10.0;
+        if (targetTekanan > 0.0) targetTekanan = 0.0;
+      } else {
+        speedBekam += 10;
+        if (speedBekam > 100) speedBekam = 100;
+      }
+    } else {
+      speedSpray += 10;
+      if (speedSpray > 100) speedSpray = 100;
+    }
+  } 
+  else if (!btnUpState && btnUpWasPressed) {
+    btnUpWasPressed = false;
+  }
+
+  // Logika Tombol Turun (DOWN)
+  bool btnDownState = digitalRead(BTN_DOWN) == LOW;
+  if (btnDownState && !btnDownWasPressed) {
+    btnDownWasPressed = true;
+    if (modeBekam) {
+      if (editTargetMode) {
+        targetTekanan -= 10.0;
+        if (targetTekanan < BATAS_MAKSIMAL_MMHG) targetTekanan = BATAS_MAKSIMAL_MMHG;
+      } else {
+        speedBekam -= 10;
+        if (speedBekam < 10) speedBekam = 10;
+      }
+    } else {
+      speedSpray -= 10;
+      if (speedSpray < 10) speedSpray = 10;
+    }
+  } 
+  else if (!btnDownState && btnDownWasPressed) {
+    btnDownWasPressed = false;
+  }
+}
+
+// Pemetaan PWM Agresif
+int getMappedPWM(int layarPersen) {
+  int targetPWM = 0;
+  if (layarPersen <= 30) {
+    targetPWM = map(layarPersen, 10, 30, 205, 225);
+  } else if (layarPersen <= 60) {
+    targetPWM = map(layarPersen, 40, 60, 226, 240);
+  } else {
+    targetPWM = map(layarPersen, 70, 100, 241, 255);
+  }
+  return targetPWM;
+}
+
+void bacaSensorMpx() {
+  float current_kPa = mpx5700.getPressureValue_kpa(0);
+  float current_mmHg = current_kPa * 7.50062;
+  tekananGaugeSaatIni = current_mmHg - tekananAwal_mmHg;
+  
+  // Filter noise saat standby
+  if (abs(tekananGaugeSaatIni) < 5.0) {
+    tekananGaugeSaatIni = 0.0;
+  }
+}
+
+void eksekusiPelatuk() {
+  if (digitalRead(BTN_TRIG) == LOW) { // Pelatuk ditarik
+    
+    if (modeBekam) { 
+      // 1. BATAS AMAN ABSOLUT: Sentuh batas maksimal mati total
+      if (tekananGaugeSaatIni <= BATAS_MAKSIMAL_MMHG) {
+        motorVakumAktif = false;
+      } 
+      // 2. TARGET TERCAPAI: Matikan motor (istirahat)
+      else if (tekananGaugeSaatIni <= targetTekanan) {
+        motorVakumAktif = false; 
+      }
+      // 3. STABILISASI KEBOCORAN: Toleransi 20 mmHg
+      else if (tekananGaugeSaatIni > (targetTekanan + toleransiKebocoran)) {
+        motorVakumAktif = true; 
+      }
+
+      // Terapkan ke Hardware
+      if (motorVakumAktif) {
+        int pwmAktif = getMappedPWM(speedBekam);
+        ledcWrite(MOTOR_VACUUM, pwmAktif); 
+      } else {
+        ledcWrite(MOTOR_VACUUM, 0); 
+      }
+      
+      ledcWrite(MOTOR_SPRAY, 0); // Matikan spray
+      
+    } else { 
+      // MODE SPRAY
+      int pwmAktif = getMappedPWM(speedSpray);
+      ledcWrite(MOTOR_SPRAY, pwmAktif);
+      ledcWrite(MOTOR_VACUUM, 0);
+    }
+  } else {
+    // Pelatuk dilepas
+    motorVakumAktif = false; 
+    ledcWrite(MOTOR_VACUUM, 0);
+    ledcWrite(MOTOR_SPRAY, 0);
+  }
+}
+
+void tampilkanLayarAktif() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 2);
+
+  // --- BARIS 1: INDIKATOR STATUS ---
+  if (digitalRead(BTN_TRIG) == LOW) {
+    if (modeBekam) {
+      if (tekananGaugeSaatIni <= BATAS_MAKSIMAL_MMHG) {
+        display.print("LIMIT -650!"); // Teks peringatan diperbarui ke -650
+      } else if (!motorVakumAktif) {
+        display.print("STABIL");      
+      } else {
+        display.print("MENGHISAP");   
+      }
+    } else {
+      display.print("SPRAY ON");
+    }
+  } else {
+    display.print("STANDBY");
+  }
+  display.drawLine(0, 12, 64, 12, SSD1306_WHITE);
+
+  // --- BARIS BAWAH: KONTEN MENU ---
+  if (modeBekam) { 
+    display.setCursor(0, 20);
+    display.print("MOD: BEKAM");
+    
+    // Target Tekanan
+    display.setCursor(0, 32);
+    if (editTargetMode) display.print(">"); else display.print(" ");
+    display.print("Tgt:" + String((int)targetTekanan));
+    
+    // Kecepatan
+    display.setCursor(0, 44);
+    if (!editTargetMode) display.print(">"); else display.print(" ");
+    display.print("Spd:" + String(speedBekam) + "%");
+    
+    // Bacaan Sensor Besar
+    display.setCursor(0, 60);
+    display.print("Tekanan:");
+    display.setCursor(0, 74);
+    display.setTextSize(2);
+    display.print(tekananGaugeSaatIni, 0);
+    display.setTextSize(1);
+    display.setCursor(0, 96);
+    display.print("mmHg");
+    
+  } else { 
+    display.setCursor(0, 20);
+    display.print("MOD: SPRAY");
+    
+    display.setCursor(0, 36);
+    display.print(">Spd:" + String(speedSpray) + "%");
+    
+    display.setCursor(0, 60);
+    display.print("DSNF SPRY");
+    display.setCursor(0, 78);
+    display.print("Siap Pakai");
+  }
+  
+  display.display();
+}
